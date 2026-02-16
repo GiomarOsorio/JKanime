@@ -1,0 +1,20 @@
+[project]
+name = "jkanime-dl"
+version = "0.1.0"
+description = "CLI tool to download anime episodes from jkanime.net with Rich TUI progress tracking"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "cloudscraper",
+    "beautifulsoup4",
+    "lxml",
+    "rich",
+    "httpx",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+jkanime-dl = "jkanime_dl.main:main"
