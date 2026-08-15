@@ -1,9 +1,108 @@
 import base64
 import json
 import re
+import urllib.parse
 
 import cloudscraper
 from bs4 import BeautifulSoup
+
+_ROMAN_SEASON = {
+    "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6,
+    "VII": 7, "VIII": 8, "IX": 9, "X": 10,
+}
+
+_SPANISH_ORDINAL_SEASON = {
+    "primera": 1, "segunda": 2, "tercera": 3, "cuarta": 4, "quinta": 5,
+    "sexta": 6, "septima": 7, "séptima": 7, "octava": 8, "novena": 9,
+    "decima": 10, "décima": 10,
+}
+
+# Title explicitly says this is the last season, just not which number it is.
+_FINAL_SEASON_MARKERS = [r"final season", r"temporada final", r"last season"]
+
+# Sequel implied but no season number (and no "this is the final one" wording either).
+_AMBIGUOUS_SEASON_MARKERS = [r"\bkanketsu\b", r"\bzoku\b"]
+
+
+def _season_match(title: str) -> tuple[str, tuple[int, int]] | tuple[None, None]:
+    """Find a season marker in a single title. Returns (label, (start, end))
+    of the matched span in `title`, or (None, None) if nothing matched."""
+    tl = title.lower()
+
+    for pattern in (
+        r"(\d+)(?:st|nd|rd|th)\s+season\b",
+        r"\bseason\s+(\d+)\b",
+        r"\btemporada\s+(\d+)\b",
+        r"\bpart(?:e)?\s+(\d+)\b",
+    ):
+        m = re.search(pattern, tl)
+        if m:
+            return f"Temporada {int(m.group(1))}", m.span()
+
+    for word, num in _SPANISH_ORDINAL_SEASON.items():
+        m = re.search(rf"\b{word}\s+temporada\b", tl)
+        if m:
+            return f"Temporada {num}", m.span()
+
+    m = re.search(r"\b([IVX]{2,5})\b", title)
+    if m and m.group(1) in _ROMAN_SEASON:
+        return f"Temporada {_ROMAN_SEASON[m.group(1)]}", m.span()
+
+    m = re.search(r"\s([2-9])\s*$", title)
+    if m:
+        return f"Temporada {int(m.group(1))}", m.span()
+
+    for pattern in _FINAL_SEASON_MARKERS:
+        m = re.search(pattern, tl)
+        if m:
+            return "Temporada Final", m.span()
+
+    for pattern in _AMBIGUOUS_SEASON_MARKERS:
+        m = re.search(pattern, tl)
+        if m:
+            return "Temporada X", m.span()
+
+    return None, None
+
+
+def split_title_and_season(*titles: str) -> tuple[str, str]:
+    """Best-effort (base_title, season_label) from anime title text.
+
+    JKAnime gives each season its own page/title (e.g. a title ending in
+    "2nd Season"), so the season wording is stripped from whichever title
+    matched to get a stable base name that all seasons of the same show can
+    share as their parent folder. Falls back to the first non-empty title
+    unchanged, paired with "Temporada 1", when no season marker is found —
+    this runs unattended, so it must never block on a guess. See
+    `determine_season` for the season-label-only rules.
+    """
+    fallback = ""
+    for title in titles:
+        if not title:
+            continue
+        t = title.strip()
+        if not fallback:
+            fallback = t
+        label, span = _season_match(t)
+        if label:
+            base = t[: span[0]].rstrip(" :-–—.,").strip()
+            base = re.sub(r"\s+(?:the|el|la|los|las)$", "", base, flags=re.IGNORECASE).strip()
+            base = base.rstrip(" :-–—.,").strip()
+            if base:
+                return base, label
+    return fallback, "Temporada 1"
+
+
+def determine_season(*titles: str) -> str:
+    """Best-effort anime season label from title text.
+
+    Returns "Temporada N" when a season number can be inferred, "Temporada
+    Final" when the title explicitly says "Final Season"/"Temporada Final"
+    (last one, number just isn't stated), "Temporada X" when a sequel is
+    implied some other ambiguous way, or "Temporada 1" as the default when
+    nothing suggests otherwise.
+    """
+    return split_title_and_season(*titles)[1]
 
 
 class JKAnimeClient:
@@ -24,7 +123,7 @@ class JKAnimeClient:
         }
 
     def get_anime_details(self, anime_url: str) -> dict:
-        """Fetch anime title and episode list from an anime page URL."""
+        """Fetch anime title, metadata and episode list from an anime page URL."""
         if not anime_url.endswith("/"):
             anime_url += "/"
 
@@ -33,18 +132,119 @@ class JKAnimeClient:
         soup = BeautifulSoup(r.text, "lxml")
 
         details = soup.find("div", class_="anime__details__content")
-        title = details.find("div", class_="anime_info").find("h3").text.strip()
-        status = details.find("div", class_="card-bod").find("ul").find_all("li")[-2].find("div").text.strip()
+        info_div = details.find("div", class_="anime_info")
 
-        last_ep_tag = details.find("a", id="uep")
-        last_episode = int(last_ep_tag.text.strip().split("-")[1].strip().split(" ")[0])
+        h3 = info_div.find("h3")
+        title = h3.text.strip()
+        alt_title_tag = h3.find_next_sibling("span")
+        alt_title = alt_title_tag.get_text(strip=True) if alt_title_tag else ""
+
+        synopsis_tag = info_div.find("p", class_="scroll")
+        synopsis = synopsis_tag.get_text(strip=True) if synopsis_tag else ""
+
+        poster = ""
+        img_tag = info_div.select_one(".movpic img")
+        if img_tag and img_tag.get("src"):
+            poster = img_tag["src"]
+        else:
+            og_image = soup.find("meta", attrs={"property": "og:image"})
+            if og_image:
+                poster = og_image.get("content", "")
+
+        fields = self._parse_info_list(details)
+        status = fields.get("Estado", "")
+
+        last_episode = self._get_episode_count(r.text, anime_url)
 
         episodes = [
             {"number": i, "name": f"EP{i:02d}", "url": f"{anime_url}{i}/"}
             for i in range(1, last_episode + 1)
         ]
 
-        return {"title": title, "status": status, "episodes": episodes}
+        folder_title, season = split_title_and_season(title, alt_title)
+
+        metadata = {
+            "titulo": title,
+            "titulo_alternativo": alt_title,
+            "sinopsis": synopsis,
+            "imagen": poster,
+            "url": anime_url,
+            "tipo": fields.get("Tipo", ""),
+            "generos": self._split_list(fields.get("Generos", "")),
+            "studios": self._split_list(fields.get("Studios", "")),
+            "temporada_emision": fields.get("Temporada", ""),
+            "idiomas": self._split_list(fields.get("Idiomas", "")),
+            "episodios": self._to_int(fields.get("Episodios", "")) or last_episode,
+            "duracion": fields.get("Duracion", ""),
+            "emitido": fields.get("Emitido", ""),
+            "estado": status,
+            "calidad": fields.get("Calidad", ""),
+            "temporada": season,
+        }
+
+        return {
+            "title": title,
+            "folder_title": folder_title,
+            "status": status,
+            "episodes": episodes,
+            "season": season,
+            "metadata": metadata,
+        }
+
+    def _get_episode_count(self, page_html: str, anime_url: str) -> int:
+        """Fetch the true episode count from the AJAX endpoint the site uses to
+        lazily load the episode list (the old static "next episode" link the
+        count used to be scraped from no longer exists in the page markup, and
+        the "Episodios" info field reads 0 for ongoing/en emision anime).
+        """
+        anime_id_match = re.search(r'data-anime="(\d+)"', page_html)
+        if not anime_id_match:
+            return 0
+
+        xsrf_token = self.scraper.cookies.get("XSRF-TOKEN")
+        if not xsrf_token:
+            return 0
+
+        headers = {
+            **self.headers,
+            "X-Requested-With": "XMLHttpRequest",
+            "X-XSRF-TOKEN": urllib.parse.unquote(xsrf_token),
+        }
+        r = self.scraper.post(
+            f"{self.BASE_URL}/ajax/episodes/{anime_id_match.group(1)}/1", headers=headers
+        )
+        r.raise_for_status()
+        return r.json().get("total", 0)
+
+    @staticmethod
+    def _parse_info_list(details_soup) -> dict:
+        """Parse the Tipo/Generos/Studios/... info list into a label -> value dict."""
+        fields = {}
+        card = details_soup.find("div", class_="card-bod")
+        if not card or not card.find("ul"):
+            return fields
+        for li in card.find("ul").find_all("li"):
+            span = li.find("span")
+            if not span:
+                continue
+            label = span.get_text(strip=True).rstrip(":").strip()
+            span.extract()
+            links = li.find_all("a")
+            if links:
+                value = ", ".join(a.get_text(strip=True) for a in links)
+            else:
+                value = li.get_text(" ", strip=True)
+            fields[label] = value
+        return fields
+
+    @staticmethod
+    def _split_list(value: str) -> list[str]:
+        return [v.strip() for v in value.split(",") if v.strip()]
+
+    @staticmethod
+    def _to_int(value: str) -> int | None:
+        m = re.search(r"\d+", value)
+        return int(m.group()) if m else None
 
     def _extract_servers(self, html: str) -> list[dict]:
         """Extract the servers array from episode page JavaScript."""

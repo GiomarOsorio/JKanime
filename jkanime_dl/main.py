@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import logging
 import re
 import shutil
@@ -39,6 +40,28 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', "_", name).strip()
 
 
+def find_ongoing_anime(output_dir: Path) -> list[str]:
+    """Scan output_dir for metadata.json files left by previous runs and
+    return the anime URLs still marked "En emision" (ongoing), so a bare
+    run can recheck those for new episodes without the URLs being passed in
+    again. Each season has its own metadata.json (see download_anime), so
+    this naturally rechecks per season rather than just per show.
+    """
+    urls = []
+    seen = set()
+    for meta_path in sorted(output_dir.rglob("metadata.json")):
+        try:
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        url = data.get("url", "")
+        estado = data.get("estado", "")
+        if url and url not in seen and "emision" in estado.lower():
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
 async def download_anime(
     client: JKAnimeClient,
     url: str,
@@ -60,8 +83,10 @@ async def download_anime(
             return
 
     title = details["title"]
+    folder_title = details["folder_title"]
+    season = details["season"]
     all_episodes = details["episodes"]
-    show_anime_info(title, details["status"], len(all_episodes))
+    show_anime_info(title, details["status"], len(all_episodes), season)
 
     # Determine episode range
     if episodes:
@@ -72,9 +97,19 @@ async def download_anime(
     selected = [ep for ep in all_episodes if start <= ep["number"] <= end]
     show_episode_table(all_episodes, (start, end))
 
-    # Prepare output directory
-    output_dir = Path(output).expanduser() / sanitize_filename(title)
+    # Prepare output directory: <output>/<anime base title>/<Temporada N|X>/
+    # folder_title has season wording stripped so every season of the same show
+    # (each a separate JKAnime page/title) lands under one shared anime folder.
+    anime_dir = Path(output).expanduser() / sanitize_filename(folder_title)
+    output_dir = anime_dir / sanitize_filename(season)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Metadata lives per season, since each JKAnime page has its own synopsis,
+    # genres and episode count even when seasons share the anime folder above.
+    metadata_path = output_dir / "metadata.json"
+    metadata_path.write_text(
+        json.dumps(details["metadata"], ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     # Check which episodes already exist
     existing = []
@@ -177,9 +212,31 @@ async def run(args: argparse.Namespace):
 
     client = JKAnimeClient()
 
-    # Determine if input is a file or a URL
+    async def scan_and_update(scan_dir: Path):
+        # Rescan scan_dir for anime still airing and recheck each for new
+        # episodes, using the URL saved in its metadata.json. Downloads land
+        # back in scan_dir too, so this is a self-contained "update" pass.
+        console.print(f"[bold]Scanning {scan_dir} for ongoing anime...[/bold]\n")
+        urls = find_ongoing_anime(scan_dir)
+        if not urls:
+            console.print("[yellow]No ongoing anime found under that folder.[/yellow]")
+            return
+        console.print(f"[bold]Found {len(urls)} ongoing anime, checking for new episodes:[/bold]\n")
+        for i, url in enumerate(urls, 1):
+            console.rule(f"[bold cyan]{i}/{len(urls)}[/bold cyan]")
+            await download_anime(client, url, str(scan_dir), args.concurrent, args.episodes, args.yes, debug)
+            console.print()
+
+    if args.url is None:
+        # No URL given: fall back to -o/--output as the folder to rescan.
+        await scan_and_update(Path(args.output).expanduser())
+        return
+
+    # Determine if input is a directory to rescan, a file of URLs, or a single URL
     input_path = Path(args.url).expanduser()
-    if input_path.is_file():
+    if input_path.is_dir():
+        await scan_and_update(input_path)
+    elif input_path.is_file():
         urls = [line.strip() for line in input_path.read_text().splitlines() if line.strip() and not line.strip().startswith("#")]
         console.print(f"[bold]Loaded {len(urls)} anime URLs from {input_path}[/bold]\n")
         for i, url in enumerate(urls, 1):
@@ -195,7 +252,14 @@ def main():
         prog="jkanime-dl",
         description="Download anime episodes from jkanime.net",
     )
-    parser.add_argument("url", help="JKAnime anime page URL or path to a file with URLs (one per line)")
+    parser.add_argument(
+        "url",
+        nargs="?",
+        default=None,
+        help="JKAnime anime page URL, a path to a file with URLs (one per line), or a "
+        "folder to rescan for ongoing anime and check for new episodes. Omit entirely "
+        "to rescan -o/--output the same way.",
+    )
     parser.add_argument("-o", "--output", default="~/Videos", help="Output directory (default: ~/Videos)")
     parser.add_argument("-c", "--concurrent", type=int, default=3, help="Concurrent downloads (default: 3)")
     parser.add_argument("-e", "--episodes", help="Episode range (e.g. 1-12, 5, 3-)")

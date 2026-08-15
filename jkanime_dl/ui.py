@@ -24,11 +24,13 @@ def show_banner():
     )
 
 
-def show_anime_info(title: str, status: str, episode_count: int):
+def show_anime_info(title: str, status: str, episode_count: int, season: str | None = None):
     table = Table(show_header=False, border_style="cyan", padding=(0, 2))
     table.add_column("Field", style="bold")
     table.add_column("Value")
     table.add_row("Title", f"[bold white]{title}[/bold white]")
+    if season:
+        table.add_row("Season", season)
     table.add_row("Status", status)
     table.add_row("Episodes", str(episode_count))
     console.print(Panel(table, title="[bold]Anime Info[/bold]", border_style="cyan"))
