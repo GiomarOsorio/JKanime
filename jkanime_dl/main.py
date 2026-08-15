@@ -173,7 +173,7 @@ async def download_anime(
 
             task_id = progress.add_task(ep_name, total=None)
 
-            def progress_cb(event: str, value: int):
+            def progress_cb(event: str, value: int | None):
                 if event == "start":
                     progress.update(task_id, total=value)
                 elif event == "update":

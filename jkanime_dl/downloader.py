@@ -1,5 +1,4 @@
 import asyncio
-import subprocess
 import traceback
 from pathlib import Path
 
@@ -17,7 +16,8 @@ async def download_mp4(url: str, dest: Path, referer: str, progress_callback=Non
             if response.status_code != 200:
                 return False
 
-            total = int(response.headers.get("content-length", 0))
+            content_length = response.headers.get("content-length")
+            total = int(content_length) if content_length else None
             if progress_callback:
                 progress_callback("start", total)
 
@@ -30,21 +30,52 @@ async def download_mp4(url: str, dest: Path, referer: str, progress_callback=Non
     return True
 
 
-async def download_hls(m3u8_url: str, dest: Path, referer: str) -> tuple[bool, str]:
-    """Download an HLS stream using ffmpeg."""
+async def download_hls(m3u8_url: str, dest: Path, referer: str, progress_callback=None) -> tuple[bool, str]:
+    """Download an HLS stream using ffmpeg.
+
+    Total size isn't known upfront (HLS has no content-length), so progress is
+    reported as bytes-written deltas parsed from ffmpeg's own `-progress`
+    output rather than a percentage — that keeps the UI honest instead of
+    showing a fake/stuck number.
+    """
     cmd = [
         "ffmpeg", "-y",
         "-headers", f"Referer: {referer}\r\n",
         "-i", m3u8_url,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
+        "-progress", "pipe:1",
+        "-nostats",
         str(dest),
     ]
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
-    _, stderr = await proc.communicate()
-    return proc.returncode == 0, stderr.decode(errors="replace") if stderr else ""
+
+    async def read_progress():
+        last_size = 0
+        async for raw_line in proc.stdout:
+            key, _, value = raw_line.decode(errors="replace").strip().partition("=")
+            if key != "total_size" or not progress_callback:
+                continue
+            try:
+                size = int(value)
+            except ValueError:
+                continue
+            if size > last_size:
+                progress_callback("update", size - last_size)
+                last_size = size
+
+    stderr_chunks = []
+
+    async def read_stderr():
+        async for line in proc.stderr:
+            stderr_chunks.append(line)
+
+    await asyncio.gather(read_progress(), read_stderr())
+    returncode = await proc.wait()
+    stderr = b"".join(stderr_chunks).decode(errors="replace")
+    return returncode == 0, stderr
 
 
 async def download_episode(
@@ -89,7 +120,7 @@ async def download_episode(
                     console.print(f"  [dim]{episode_name}: Trying HLS from {server}: {stream['src'][:80]}[/dim]")
                 if progress_callback:
                     progress_callback("hls", 0)
-                ok, stderr_out = await download_hls(stream["src"], dest, referer)
+                ok, stderr_out = await download_hls(stream["src"], dest, referer, progress_callback)
                 if ok and dest.exists() and dest.stat().st_size > 0:
                     return str(dest)
                 if debug:
