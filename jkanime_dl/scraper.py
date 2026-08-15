@@ -201,9 +201,14 @@ class JKAnimeClient:
         if not anime_id_match:
             return 0
 
-        xsrf_token = self.scraper.cookies.get("XSRF-TOKEN")
-        if not xsrf_token:
+        # Batch runs reuse one session across many anime pages, so the jar can
+        # end up holding more than one "XSRF-TOKEN" cookie (different
+        # domain/path scoping) — cookies.get() raises CookieConflictError as
+        # soon as that happens, so pick the most recently set one instead.
+        xsrf_tokens = [c.value for c in self.scraper.cookies if c.name == "XSRF-TOKEN"]
+        if not xsrf_tokens:
             return 0
+        xsrf_token = xsrf_tokens[-1]
 
         headers = {
             **self.headers,
