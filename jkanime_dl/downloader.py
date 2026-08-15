@@ -9,23 +9,33 @@ console = Console()
 
 
 async def download_mp4(url: str, dest: Path, referer: str, progress_callback=None) -> bool:
-    """Download an MP4 file with streaming and progress reporting."""
+    """Download an MP4 file with streaming and progress reporting.
+
+    Cleans up a partial dest file on any interruption, including Ctrl+C /
+    task cancellation (neither is an Exception subclass, so this catches
+    BaseException rather than Exception) — otherwise a half-written file
+    looks complete on the next run, since nothing recorded its real size.
+    """
     headers = {"Referer": referer}
-    async with httpx.AsyncClient(follow_redirects=True, timeout=30, verify=False, headers=headers) as client:
-        async with client.stream("GET", url) as response:
-            if response.status_code != 200:
-                return False
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30, verify=False, headers=headers) as client:
+            async with client.stream("GET", url) as response:
+                if response.status_code != 200:
+                    return False
 
-            content_length = response.headers.get("content-length")
-            total = int(content_length) if content_length else None
-            if progress_callback:
-                progress_callback("start", total)
+                content_length = response.headers.get("content-length")
+                total = int(content_length) if content_length else None
+                if progress_callback:
+                    progress_callback("start", total)
 
-            with open(dest, "wb") as f:
-                async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
-                    f.write(chunk)
-                    if progress_callback:
-                        progress_callback("update", len(chunk))
+                with open(dest, "wb") as f:
+                    async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
+                        f.write(chunk)
+                        if progress_callback:
+                            progress_callback("update", len(chunk))
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        raise
 
     return True
 
@@ -72,8 +82,17 @@ async def download_hls(m3u8_url: str, dest: Path, referer: str, progress_callbac
         async for line in proc.stderr:
             stderr_chunks.append(line)
 
-    await asyncio.gather(read_progress(), read_stderr())
-    returncode = await proc.wait()
+    try:
+        await asyncio.gather(read_progress(), read_stderr())
+        returncode = await proc.wait()
+    except BaseException:
+        # Ctrl+C / task cancellation: kill the still-running ffmpeg rather
+        # than leaving it orphaned, and drop its partial output so the next
+        # run doesn't mistake it for a completed download.
+        proc.kill()
+        await proc.wait()
+        dest.unlink(missing_ok=True)
+        raise
     stderr = b"".join(stderr_chunks).decode(errors="replace")
     return returncode == 0, stderr
 
