@@ -295,7 +295,7 @@ def main():
         "to rescan -o/--output the same way.",
     )
     parser.add_argument("-o", "--output", default="~/Videos", help="Output directory (default: ~/Videos)")
-    parser.add_argument("-c", "--concurrent", type=int, default=3, help="Concurrent downloads (default: 3)")
+    parser.add_argument("-c", "--concurrent", type=int, default=1, help="Concurrent downloads (default: 1 — slower but avoids Cloudflare/rate-limit resets from parallel bursts)")
     parser.add_argument("-e", "--episodes", help="Episode range (e.g. 1-12, 5, 3-)")
     parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
     parser.add_argument("--debug", action="store_true", help="Show debug info (streams, errors, tracebacks)")

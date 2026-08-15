@@ -414,6 +414,7 @@ class JKAnimeClient:
 
         sorted_servers = sorted(servers, key=server_priority)
 
+        first = True
         for server in sorted_servers:
             remote = server.get("remote", "")
             server_name = server.get("server", "").lower()
@@ -423,6 +424,14 @@ class JKAnimeClient:
             embed_url = self._decode_remote(remote)
             if not embed_url:
                 continue
+
+            # Small pause between third-party embed hosts — probing all 5
+            # back to back is the same bursty pattern that gets anime pages
+            # rate-limited, just aimed at different domains.
+            if first:
+                first = False
+            else:
+                time.sleep(random.uniform(0.3, 0.8))
 
             src = self._extract_from_embed(embed_url, server_name)
             if src and src not in seen:
