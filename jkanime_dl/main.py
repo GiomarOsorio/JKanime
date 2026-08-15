@@ -106,17 +106,39 @@ async def download_anime(
 
     # Metadata lives per season, since each JKAnime page has its own synopsis,
     # genres and episode count even when seasons share the anime folder above.
+    # "descargados" (episode name -> byte size at the moment it finished) is
+    # the one field we own rather than the scraper, so carry it over from
+    # whatever was already on disk instead of clobbering it with the fresh scrape.
     metadata_path = output_dir / "metadata.json"
-    metadata_path.write_text(
-        json.dumps(details["metadata"], ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    downloaded_sizes: dict[str, int] = {}
+    if metadata_path.exists():
+        try:
+            downloaded_sizes = json.loads(metadata_path.read_text(encoding="utf-8")).get("descargados", {})
+        except (json.JSONDecodeError, OSError):
+            pass
+    metadata = {**details["metadata"], "descargados": downloaded_sizes}
+    metadata_lock = asyncio.Lock()
 
-    # Check which episodes already exist
+    async def save_metadata():
+        async with metadata_lock:
+            metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    await save_metadata()
+
+    # Check which episodes already exist. A file only counts as "already
+    # downloaded" if its size on disk still matches what was recorded when it
+    # finished — a size mismatch means a previous run was interrupted mid
+    # download and left a partial file that looked complete just because it
+    # existed. No recorded size at all (episode predates this check, or was
+    # never confirmed) is trusted as-is rather than forcing a mass re-download.
     existing = []
     pending = []
     for ep in selected:
         dest = output_dir / f"{ep['name']}.mp4"
-        if dest.exists() and dest.stat().st_size > 0:
+        recorded_size = downloaded_sizes.get(ep["name"])
+        if dest.exists() and dest.stat().st_size > 0 and (
+            recorded_size is None or dest.stat().st_size == recorded_size
+        ):
             existing.append(ep)
         else:
             pending.append(ep)
@@ -186,6 +208,8 @@ async def download_anime(
 
             if result:
                 success_count += 1
+                downloaded_sizes[ep_name] = Path(result).stat().st_size
+                await save_metadata()
                 show_episode_result(ep_name, True, result)
             else:
                 failed_count += 1
