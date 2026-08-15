@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import logging
+import random
 import re
 import shutil
 import sys
@@ -23,6 +24,11 @@ from jkanime_dl.ui import (
 )
 
 logger = logging.getLogger("jkanime-dl")
+
+# Random delay between anime in a batch run, so a burst of same-second
+# requests doesn't read as a bot to Cloudflare/the site's own rate limiting
+# (cloudscraper only solves the JS challenge, it doesn't hide request pacing).
+BATCH_PACING_SECONDS = (1.5, 3.5)
 
 
 def parse_episode_range(range_str: str, max_ep: int) -> tuple[int, int]:
@@ -247,6 +253,8 @@ async def run(args: argparse.Namespace):
             return
         console.print(f"[bold]Found {len(urls)} ongoing anime, checking for new episodes:[/bold]\n")
         for i, url in enumerate(urls, 1):
+            if i > 1:
+                await asyncio.sleep(random.uniform(*BATCH_PACING_SECONDS))
             console.rule(f"[bold cyan]{i}/{len(urls)}[/bold cyan]")
             await download_anime(client, url, str(scan_dir), args.concurrent, args.episodes, args.yes, debug)
             console.print()
@@ -264,6 +272,8 @@ async def run(args: argparse.Namespace):
         urls = [line.strip() for line in input_path.read_text().splitlines() if line.strip() and not line.strip().startswith("#")]
         console.print(f"[bold]Loaded {len(urls)} anime URLs from {input_path}[/bold]\n")
         for i, url in enumerate(urls, 1):
+            if i > 1:
+                await asyncio.sleep(random.uniform(*BATCH_PACING_SECONDS))
             console.rule(f"[bold cyan]{i}/{len(urls)}[/bold cyan]")
             await download_anime(client, url, args.output, args.concurrent, args.episodes, args.yes, debug)
             console.print()

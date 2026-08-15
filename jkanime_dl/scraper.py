@@ -1,10 +1,21 @@
 import base64
 import json
+import random
 import re
+import time
 import urllib.parse
 
 import cloudscraper
+import requests
 from bs4 import BeautifulSoup
+
+# Transient network failures worth retrying — a Cloudflare/origin connection
+# reset under request bursts, not a real error like a 404.
+_RETRYABLE_EXCEPTIONS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
 
 _ROMAN_SEASON = {
     "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6,
@@ -122,12 +133,26 @@ class JKAnimeClient:
             "Referer": self.BASE_URL,
         }
 
+    def _request(self, method, *args, retries: int = 3, **kwargs):
+        """Run a cloudscraper request, retrying transient connection failures
+        with backoff (+ jitter so a batch of anime doesn't retry in lockstep).
+        """
+        delay = 1.0
+        for attempt in range(retries):
+            try:
+                return method(*args, **kwargs)
+            except _RETRYABLE_EXCEPTIONS:
+                if attempt == retries - 1:
+                    raise
+                time.sleep(delay + random.uniform(0, 0.5))
+                delay *= 2
+
     def get_anime_details(self, anime_url: str) -> dict:
         """Fetch anime title, metadata and episode list from an anime page URL."""
         if not anime_url.endswith("/"):
             anime_url += "/"
 
-        r = self.scraper.get(anime_url, headers=self.headers)
+        r = self._request(self.scraper.get, anime_url, headers=self.headers)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
 
@@ -218,8 +243,8 @@ class JKAnimeClient:
             "X-Requested-With": "XMLHttpRequest",
             "X-XSRF-TOKEN": urllib.parse.unquote(xsrf_token),
         }
-        r = self.scraper.post(
-            f"{self.BASE_URL}/ajax/episodes/{anime_id_match.group(1)}/1", headers=headers
+        r = self._request(
+            self.scraper.post, f"{self.BASE_URL}/ajax/episodes/{anime_id_match.group(1)}/1", headers=headers
         )
         r.raise_for_status()
         return r.json().get("total", 0)
@@ -282,7 +307,7 @@ class JKAnimeClient:
     def _extract_from_embed(self, embed_url: str, server_name: str) -> str | None:
         """Extract the direct video URL from a third-party embed page."""
         try:
-            r = self.scraper.get(embed_url, headers={**self.headers, "Referer": self.BASE_URL})
+            r = self._request(self.scraper.get, embed_url, headers={**self.headers, "Referer": self.BASE_URL}, retries=2)
         except Exception:
             return None
 
@@ -373,7 +398,7 @@ class JKAnimeClient:
         seen = set()
         streams = []
 
-        r = self.scraper.get(episode_url, headers=self.headers)
+        r = self._request(self.scraper.get, episode_url, headers=self.headers)
         r.raise_for_status()
 
         servers = self._extract_servers(r.text)
