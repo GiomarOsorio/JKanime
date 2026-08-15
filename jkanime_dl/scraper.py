@@ -154,7 +154,7 @@ class JKAnimeClient:
         fields = self._parse_info_list(details)
         status = fields.get("Estado", "")
 
-        last_episode = self._get_episode_count(r.text, anime_url)
+        last_episode = self._get_episode_count(r, anime_url)
 
         episodes = [
             {"number": i, "name": f"EP{i:02d}", "url": f"{anime_url}{i}/"}
@@ -191,24 +191,27 @@ class JKAnimeClient:
             "metadata": metadata,
         }
 
-    def _get_episode_count(self, page_html: str, anime_url: str) -> int:
+    def _get_episode_count(self, response, anime_url: str) -> int:
         """Fetch the true episode count from the AJAX endpoint the site uses to
         lazily load the episode list (the old static "next episode" link the
         count used to be scraped from no longer exists in the page markup, and
         the "Episodios" info field reads 0 for ongoing/en emision anime).
         """
-        anime_id_match = re.search(r'data-anime="(\d+)"', page_html)
+        anime_id_match = re.search(r'data-anime="(\d+)"', response.text)
         if not anime_id_match:
             return 0
 
-        # Batch runs reuse one session across many anime pages, so the jar can
-        # end up holding more than one "XSRF-TOKEN" cookie (different
-        # domain/path scoping) — cookies.get() raises CookieConflictError as
-        # soon as that happens, so pick the most recently set one instead.
-        xsrf_tokens = [c.value for c in self.scraper.cookies if c.name == "XSRF-TOKEN"]
-        if not xsrf_tokens:
+        # Laravel reissues XSRF-TOKEN on every response, so the token that
+        # matches *this* page is the one this response's own Set-Cookie set —
+        # not whatever happens to be last in the whole session's cookie jar,
+        # which in a batch run holds one stale/mismatched entry per anime
+        # already fetched and gets a 419 (CSRF mismatch) if picked wrong.
+        # Session jar is only a fallback for the rare response that sets none.
+        xsrf_token = self._pick_cookie(response.cookies, "XSRF-TOKEN") or self._pick_cookie(
+            self.scraper.cookies, "XSRF-TOKEN"
+        )
+        if not xsrf_token:
             return 0
-        xsrf_token = xsrf_tokens[-1]
 
         headers = {
             **self.headers,
@@ -220,6 +223,13 @@ class JKAnimeClient:
         )
         r.raise_for_status()
         return r.json().get("total", 0)
+
+    @staticmethod
+    def _pick_cookie(jar, name: str) -> str | None:
+        """Like jar.get(name), but never raises on duplicate names — picks the
+        last matching cookie in the jar instead of erroring."""
+        values = [c.value for c in jar if c.name == name]
+        return values[-1] if values else None
 
     @staticmethod
     def _parse_info_list(details_soup) -> dict:
